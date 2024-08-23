@@ -12,7 +12,7 @@ import psycopg2
 import re
 from textwrap import shorten
 
-from odoo import api, fields, models, _, Command
+from odoo import api, fields, models, _, Command, SUPERUSER_ID
 from odoo.addons.account.tools import format_structured_reference_iso
 from odoo.exceptions import UserError, ValidationError, AccessError, RedirectWarning
 from odoo.tools import (
@@ -32,6 +32,7 @@ from odoo.tools import (
     is_html_empty,
     create_index,
 )
+from odoo.addons.base_import.models.base_import import FILE_TYPE_DICT
 
 _logger = logging.getLogger(__name__)
 
@@ -590,6 +591,8 @@ class AccountMove(models.Model):
     partner_credit = fields.Monetary(compute='_compute_partner_credit')
     duplicated_ref_ids = fields.Many2many(comodel_name='account.move', compute='_compute_duplicated_ref_ids')
     need_cancel_request = fields.Boolean(compute='_compute_need_cancel_request')
+
+    show_update_fpos = fields.Boolean(string="Has Fiscal Position Changed", store=False)  # True if the fiscal position was changed
 
     # used to display the various dates and amount dues on the invoice's PDF
     payment_term_details = fields.Binary(compute="_compute_payment_term_details", exportable=False)
@@ -1776,6 +1779,10 @@ class AccountMove(models.Model):
 
             # Reset
             self.invoice_vendor_bill_id = False
+
+    @api.onchange('fiscal_position_id')
+    def _onchange_fpos_id_show_update_fpos(self):
+        self.show_update_fpos = self.line_ids and self._origin.fiscal_position_id != self.fiscal_position_id
 
     @api.onchange('partner_id')
     def _onchange_partner_id(self):
@@ -3146,6 +3153,7 @@ class AccountMove(models.Model):
                 file_data['type'] == 'binary'
                 and self._context.get('from_alias')
                 and not attachments_by_invoice.get(file_data['attachment'])
+                and file_data['attachment'].mimetype not in FILE_TYPE_DICT
             ):
                 close_file(file_data)
                 continue
@@ -3180,12 +3188,11 @@ class AccountMove(models.Model):
             if decoder:
                 try:
                     with self.env.cr.savepoint():
-                        with current_invoice._get_edi_creation() as invoice:
-                            # pylint: disable=not-callable
-                            success = decoder(invoice, file_data, new)
-                        if success or file_data['type'] == 'pdf':
-                            invoice._link_bill_origin_to_purchase_orders(timeout=4)
+                        invoice = current_invoice or self.create({})
+                        success = decoder(invoice, file_data, new)
 
+                        if success or file_data['type'] == 'pdf' or file_data['attachment'].mimetype in FILE_TYPE_DICT:
+                            invoice._link_bill_origin_to_purchase_orders(timeout=4)
                             invoices |= invoice
                             current_invoice = self.env['account.move']
                             add_file_data_results(file_data, invoice)
@@ -3196,7 +3203,7 @@ class AccountMove(models.Model):
                     raise
                 except Exception:
                     message = _("Error importing attachment '%s' as invoice (decoder=%s)", file_data['filename'], decoder.__name__)
-                    invoice.sudo().message_post(body=message)
+                    current_invoice.sudo().message_post(body=message)
                     _logger.exception(message)
 
             passed_file_data_list.append(file_data)
@@ -3769,8 +3776,8 @@ class AccountMove(models.Model):
             return
         to_reverse = self.env['account.move']
         to_unlink = self.env['account.move']
-        lock_date = self.company_id._get_user_fiscal_lock_date()
         for move in self:
+            lock_date = move.company_id._get_user_fiscal_lock_date()
             if move.inalterable_hash or move.date <= lock_date:
                 to_reverse += move
             else:
@@ -3986,6 +3993,10 @@ class AccountMove(models.Model):
             'target': 'current',
         }
 
+    def action_update_fpos_values(self):
+        self.invoice_line_ids._compute_tax_ids()
+        self.line_ids._compute_account_id()
+
     def open_created_caba_entries(self):
         self.ensure_one()
         return {
@@ -4123,6 +4134,8 @@ class AccountMove(models.Model):
     def button_draft(self):
         if any(move.state not in ('cancel', 'posted') for move in self):
             raise UserError(_("Only posted/cancelled journal entries can be reset to draft."))
+        if any(move.need_cancel_request for move in self):
+            raise UserError(_("You can't reset to draft those journal entries. You need to request a cancellation instead."))
 
         self._check_draftable()
         # We remove all the analytics entries for this journal
@@ -4720,37 +4733,16 @@ class AccountMove(models.Model):
         res = super()._message_post_after_hook(new_message, message_values)
 
         attachments = new_message.attachment_ids
-        if not attachments or self.env.context.get('no_new_invoice') or not self.is_invoice(include_receipts=True):
+        attachments_per_invoice = defaultdict(lambda: self.env['ir.attachment'])
+
+        checked_attachment = self._check_and_decode_attachment(attachments)
+        if not checked_attachment:
             return res
 
-        odoobot = self.env.ref('base.partner_root')
-        if self.state != 'draft':
-            self.message_post(body=_('The invoice is not a draft, it was not updated from the attachment.'),
-                              message_type='comment',
-                              subtype_xmlid='mail.mt_note',
-                              author_id=odoobot.id)
-            return res
-
-        # As we are coming from the mail, we assume that ONE of the attachments
-        # will enhance the invoice thanks to EDI / OCR / .. capabilities
-        has_existing_lines = bool(self.invoice_line_ids)
-        results = self._extend_with_attachments(attachments, new=bool(self._context.get('from_alias')))
-        if has_existing_lines and not results:
-            self.message_post(body=_('The invoice already contains lines, it was not updated from the attachment.'),
-                              message_type='comment',
-                              subtype_xmlid='mail.mt_note',
-                              author_id=odoobot.id)
-            return res
-        attachments_per_invoice = defaultdict(self.env['ir.attachment'].browse)
-        attachments_in_invoices = self.env['ir.attachment']
-        for attachment, invoices in results.items():
-            attachments_in_invoices += attachment
+        for attachment_in_res, invoices in checked_attachment.items():
             invoices = invoices or self
             for invoice in invoices:
-                attachments_per_invoice[invoice] |= attachment
-
-        # Unlink the unused attachments
-        (attachments - attachments_in_invoices).unlink()
+                attachments_per_invoice[invoice] |= attachment_in_res
 
         for invoice, attachments in attachments_per_invoice.items():
             if invoice == self:
@@ -4770,6 +4762,32 @@ class AccountMove(models.Model):
                 super(AccountMove, invoice)._message_post_after_hook(sub_new_message, sub_message_values)
 
         return res
+
+    def _check_and_decode_attachment(self, attachments):
+        if not attachments or self.env.context.get('no_new_invoice') or not self.is_invoice(include_receipts=True):
+            return False
+        if self.state != 'draft':
+            self.with_user(SUPERUSER_ID).message_post(
+                body=_('The invoice is not a draft, it was not updated from the attachment.'),
+                message_type='comment',
+            )
+            return False
+
+        # As we are coming from the mail, we assume that ONE of the attachments
+        # will enhance the invoice thanks to EDI / OCR / .. capabilities
+        move_per_decodable_attachment = self._extend_with_attachments(attachments, new=bool(self._context.get('from_alias')))
+        if self.invoice_line_ids and not move_per_decodable_attachment:
+            self.with_user(SUPERUSER_ID).message_post(
+                body=_('The invoice already contains lines, it was not updated from the attachment.'),
+                message_type='comment',
+            )
+            return False
+        attachments_in_invoices = self.env['ir.attachment']
+        for attachment in move_per_decodable_attachment:
+            attachments_in_invoices += attachment
+        # Unlink the unused attachments
+        (attachments - attachments_in_invoices).unlink()
+        return move_per_decodable_attachment
 
     def _creation_subtype(self):
         # EXTENDS mail mail.thread
@@ -4815,7 +4833,11 @@ class AccountMove(models.Model):
             force_email_company=force_email_company, force_email_lang=force_email_lang
         )
         subtitles = [render_context['record'].name]
-        if self.invoice_date_due and self.payment_state not in ('in_payment', 'paid'):
+        if (
+            self.invoice_date_due
+            and self.is_invoice(include_receipts=True)
+            and self.payment_state not in ('in_payment', 'paid')
+        ):
             subtitles.append(_('%(amount)s due\N{NO-BREAK SPACE}%(date)s',
                            amount=format_amount(self.env, self.amount_total, self.currency_id, lang_code=render_context.get('lang')),
                            date=format_date(self.env, self.invoice_date_due, date_format='short', lang_code=render_context.get('lang'))
@@ -4860,6 +4882,13 @@ class AccountMove(models.Model):
         """
         self.ensure_one()
         return True
+
+    def _can_force_cancel(self):
+        """ Hook to indicate whether it should be possible to force-cancel this invoice,
+        that is, cancel it without waiting for the cancellation request to succeed.
+        """
+        self.ensure_one()
+        return False
 
     @contextmanager
     def _send_only_when_ready(self):
